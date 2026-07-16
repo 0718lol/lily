@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Lily OpenMaintainer human-in-the-loop maintenance console">
+  <title>Lily OpenMaintainer</title>
+  <link rel="stylesheet" href="/static/style.css?v=0.2.1">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">L</div>
+        <div>
+          <strong>Lily</strong>
+          <span>OpenMaintainer</span>
+        </div>
+      </div>
+
+      <nav class="nav" aria-label="主导航">
+        <button class="nav-item is-active" data-view="tasks">
+          <span class="nav-icon" aria-hidden="true">▦</span>
+          任务流
+        </button>
+        <button class="nav-item" data-view="approval">
+          <span class="nav-icon" aria-hidden="true">✓</span>
+          审批区
+          <span class="nav-count" id="approvalNavCount">0</span>
+        </button>
+        <button class="nav-item" data-view="events">
+          <span class="nav-icon" aria-hidden="true">≡</span>
+          运行记录
+        </button>
+      </nav>
+
+      <div class="runtime-panel">
+        <span class="eyebrow">执行器</span>
+        <div class="runtime-row">
+          <span class="status-dot" id="runtimeDot"></span>
+          <strong id="runtimeMode">检查中</strong>
+        </div>
+        <span id="runtimeModel">-</span>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div>
+          <span class="eyebrow">持续维护控制台</span>
+          <h1 id="pageTitle">任务流</h1>
+        </div>
+        <div class="toolbar">
+          <button class="icon-button" id="refreshButton" title="刷新" aria-label="刷新">↻</button>
+          <button class="button button-secondary" id="pauseButton">暂停循环</button>
+          <button class="button button-primary" id="newTaskButton"><span aria-hidden="true">＋</span> 新建任务</button>
+        </div>
+      </header>
+
+      <section class="metrics" aria-label="运行指标">
+        <article class="metric">
+          <span>活动任务</span>
+          <strong id="activeMetric">0</strong>
+          <small>排队与执行中</small>
+        </article>
+        <article class="metric">
+          <span>等待审批</span>
+          <strong id="approvalMetric">0</strong>
+          <small>需要人工决定</small>
+        </article>
+        <article class="metric">
+          <span>已通过</span>
+          <strong id="approvedMetric">0</strong>
+          <small>累计任务</small>
+        </article>
+        <article class="metric metric-usage">
+          <div>
+            <span>Token 使用</span>
+            <strong id="tokenMetric">0</strong>
+            <small>输入与输出合计</small>
+          </div>
+          <canvas id="usageChart" width="160" height="58" aria-label="Token 使用趋势"></canvas>
+        </article>
+      </section>
+
+      <section class="workspace" id="tasksView">
+        <div class="task-panel">
+          <div class="section-head">
+            <div>
+              <h2>维护队列</h2>
+              <p id="taskSummary">0 个任务</p>
+            </div>
+            <div class="segmented" role="group" aria-label="任务筛选">
+              <button class="segment is-active" data-filter="all">全部</button>
+              <button class="segment" data-filter="active">进行中</button>
+              <button class="segment" data-filter="review">待审批</button>
+            </div>
+          </div>
+
+          <div class="task-table" role="table" aria-label="维护任务">
+            <div class="task-row task-header" role="row">
+              <span>任务</span>
+              <span>状态</span>
+              <span>优先级</span>
+              <span>更新时间</span>
+              <span></span>
+            </div>
+            <div id="taskList"></div>
+          </div>
+          <div class="empty-state" id="taskEmpty" hidden>
+            <strong>队列是空的</strong>
+            <span>创建一个维护任务开始运行。</span>
+          </div>
+        </div>
+
+        <aside class="activity-panel">
+          <div class="section-head compact">
+            <div>
+              <h2>实时事件</h2>
+              <p>最近 80 条</p>
+            </div>
+            <span class="live-indicator"><i></i> LIVE</span>
+          </div>
+          <div class="event-list" id="eventList"></div>
+        </aside>
+      </section>
+
+      <section class="full-view" id="approvalView" hidden>
+        <div class="section-head">
+          <div>
+            <h2>人工审批</h2>
+            <p>所有模型结果都在这里停止，直到你作出决定。</p>
+          </div>
+        </div>
+        <div class="approval-list" id="approvalList"></div>
+      </section>
+
+      <section class="full-view" id="eventsView" hidden>
+        <div class="section-head">
+          <div>
+            <h2>运行记录</h2>
+            <p>任务生命周期与系统控制事件。</p>
+          </div>
+        </div>
+        <div class="event-table" id="eventTable"></div>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="taskDialog" class="dialog">
+    <form method="dialog" id="taskForm">
+      <header class="dialog-head">
+        <div>
+          <span class="eyebrow">加入维护队列</span>
+          <h2>新建任务</h2>
+        </div>
+        <button class="icon-button" type="button" data-close-task title="关闭" aria-label="关闭">×</button>
+      </header>
+
+      <div class="form-grid">
+        <label class="field field-wide">
+          <span>任务标题</span>
+          <input name="title" required minlength="3" maxlength="160" placeholder="例如：为配置解析器补充边界测试">
+        </label>
+        <label class="field">
+          <span>仓库</span>
+          <input name="repository" maxlength="500" placeholder="owner/repository">
+        </label>
+        <label class="field">
+          <span>Issue 地址</span>
+          <input name="issue_url" maxlength="1000" placeholder="https://github.com/.../issues/12">
+        </label>
+        <label class="field field-wide">
+          <span>本地 Git 仓库路径</span>
+          <input name="repository_path" maxlength="1200" placeholder="/Users/you/projects/repository">
+        </label>
+        <label class="field">
+          <span>优先级</span>
+          <select name="priority">
+            <option value="1">P1 紧急</option>
+            <option value="2" selected>P2 正常</option>
+            <option value="3">P3 稍后</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>风险等级</span>
+          <select name="risk">
+            <option value="low" selected>低风险</option>
+            <option value="medium">中风险</option>
+            <option value="high">高风险</option>
+          </select>
+        </label>
+        <label class="field field-wide">
+          <span>任务描述</span>
+          <textarea name="description" required minlength="10" maxlength="8000" rows="7" placeholder="描述现状、目标、约束和验收条件。"></textarea>
+        </label>
+      </div>
+
+      <footer class="dialog-actions">
+        <span id="formError" class="form-error"></span>
+        <button class="button button-secondary" type="button" data-close-task>取消</button>
+        <button class="button button-primary" type="submit" value="default">加入队列</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <dialog id="detailDialog" class="dialog dialog-detail">
+    <div id="detailContent"></div>
+  </dialog>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <script src="/static/app.js?v=0.2.1" defer></script>
+</body>
+</html>

@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.env
+lily.db*
+lily-worktrees/
+codex-last-message-*.json
+*.log
+.DS_Store
