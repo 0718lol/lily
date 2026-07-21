@@ -1,5 +1,7 @@
 import asyncio
+import uuid
 from contextlib import asynccontextmanager, suppress
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
@@ -9,12 +11,13 @@ from pydantic import BaseModel, Field
 
 from agent import TaskExecutor
 from config import settings
-from database import Database
+from database import Database, LeaseLostError
 
 
 db = Database(settings.db_path)
 executor = TaskExecutor(settings)
 connections: set[WebSocket] = set()
+worker_id = uuid.uuid4().hex
 
 
 class TaskCreate(BaseModel):
@@ -42,12 +45,36 @@ async def broadcast(event: str = "refresh") -> None:
         connections.discard(connection)
 
 
+async def heartbeat_loop(task_id: str) -> None:
+    while True:
+        await asyncio.sleep(settings.heartbeat_interval)
+        if not db.heartbeat_task(task_id, worker_id):
+            raise LeaseLostError(f"任务 {task_id} 的执行租约已失效")
+
+
+def verification_status(result: Any) -> str:
+    status = str(result.metadata.get("verification_status", "")).strip()
+    if status:
+        return status
+    if result.key == "verification":
+        for candidate in ("NEEDS_REVISION", "READY_FOR_HUMAN_REVIEW"):
+            if candidate in result.content:
+                return candidate
+    return ""
+
+
 async def process_task(task: dict[str, Any]) -> None:
     total_input = task["input_tokens"]
     total_output = task["output_tokens"]
+    verdict = ""
+    heartbeat = asyncio.create_task(heartbeat_loop(task["id"]))
     try:
         mode = executor.resolve_mode(task)
-        db.update_task(task["id"], executor_mode=mode)
+        db.update_task(
+            task["id"],
+            expected_lease_owner=worker_id,
+            executor_mode=mode,
+        )
         if mode == "codex-cli":
             db.add_event("codex.started", "Codex 已在隔离工作树中开始执行", task["id"])
             await broadcast("codex.started")
@@ -60,8 +87,13 @@ async def process_task(task: dict[str, Any]) -> None:
                 "output_tokens": total_output,
             }
             updates.update(result.metadata)
+            stage_verdict = verification_status(result)
+            if stage_verdict:
+                verdict = stage_verdict
+                updates["verification_status"] = stage_verdict
             db.update_task(
                 task["id"],
+                expected_lease_owner=worker_id,
                 **updates,
             )
             db.add_event(
@@ -71,16 +103,34 @@ async def process_task(task: dict[str, Any]) -> None:
                 {"stage": result.key},
             )
             await broadcast("task.updated")
-        db.complete_task(task["id"])
+        db.complete_task(
+            task["id"],
+            ready_for_review=verdict == "READY_FOR_HUMAN_REVIEW",
+            lease_owner=worker_id,
+        )
+    except LeaseLostError:
+        db.add_event("task.lease_lost", "执行租约已失效，停止写入结果", task["id"])
     except Exception as exc:
-        db.fail_task(task["id"], str(exc))
+        try:
+            db.fail_task(task["id"], str(exc), lease_owner=worker_id)
+        except LeaseLostError:
+            db.add_event("task.lease_lost", "执行租约已失效，忽略迟到的失败结果", task["id"])
+    finally:
+        heartbeat.cancel()
+        with suppress(asyncio.CancelledError, LeaseLostError):
+            await heartbeat
     await broadcast("task.updated")
 
 
 async def worker_loop() -> None:
     while True:
+        stale_before = (
+            datetime.now(timezone.utc) - timedelta(seconds=settings.lease_timeout)
+        ).isoformat()
+        if db.recover_stale_tasks(stale_before):
+            await broadcast("task.recovered")
         if not db.is_paused():
-            task = db.claim_next_task()
+            task = db.claim_next_task(worker_id)
             if task:
                 await broadcast("task.started")
                 await process_task(task)
@@ -100,7 +150,7 @@ async def lifespan(_: FastAPI):
             await task
 
 
-app = FastAPI(title="Lily OpenMaintainer", version="0.2.1", lifespan=lifespan)
+app = FastAPI(title="Lily OpenMaintainer", version="0.3.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=settings.root / "static"), name="static")
 
 

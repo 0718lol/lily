@@ -183,7 +183,7 @@ h2 { font-size: 16px; letter-spacing: 0; }
 .status-running { color: var(--amber); background: var(--amber-soft); }
 .status-awaiting_approval { color: #7552a6; background: #f1eafa; }
 .status-approved { color: var(--green); background: var(--green-soft); }
-.status-failed, .status-rejected { color: var(--red); background: var(--red-soft); }
+.status-needs_revision, .status-failed, .status-rejected { color: var(--red); background: var(--red-soft); }
 .priority { font-size: 12px; font-weight: 700; }
 .priority-P1 { color: var(--red); }
 .priority-P2 { color: var(--amber); }

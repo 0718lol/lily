@@ -20,6 +20,9 @@ TASK_FIELDS = {
     "executor_mode",
     "worktree_path",
     "codex_session_id",
+    "lease_owner",
+    "heartbeat_at",
+    "verification_status",
     "error",
     "input_tokens",
     "output_tokens",
@@ -27,6 +30,10 @@ TASK_FIELDS = {
     "started_at",
     "finished_at",
 }
+
+
+class LeaseLostError(RuntimeError):
+    pass
 
 
 def utc_now() -> str:
@@ -75,6 +82,9 @@ class Database:
                     executor_mode TEXT NOT NULL DEFAULT '',
                     worktree_path TEXT NOT NULL DEFAULT '',
                     codex_session_id TEXT NOT NULL DEFAULT '',
+                    lease_owner TEXT NOT NULL DEFAULT '',
+                    heartbeat_at TEXT,
+                    verification_status TEXT NOT NULL DEFAULT '',
                     error TEXT NOT NULL DEFAULT '',
                     input_tokens INTEGER NOT NULL DEFAULT 0,
                     output_tokens INTEGER NOT NULL DEFAULT 0,
@@ -113,6 +123,9 @@ class Database:
                 "executor_mode": "TEXT NOT NULL DEFAULT ''",
                 "worktree_path": "TEXT NOT NULL DEFAULT ''",
                 "codex_session_id": "TEXT NOT NULL DEFAULT ''",
+                "lease_owner": "TEXT NOT NULL DEFAULT ''",
+                "heartbeat_at": "TEXT",
+                "verification_status": "TEXT NOT NULL DEFAULT ''",
             }
             for column, definition in migrations.items():
                 if column not in existing:
@@ -185,7 +198,7 @@ class Database:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def claim_next_task(self) -> dict[str, Any] | None:
+    def claim_next_task(self, worker_id: str) -> dict[str, Any] | None:
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute(
@@ -198,17 +211,77 @@ class Database:
                 """
                 UPDATE tasks
                 SET status = 'running', attempts = attempts + 1, started_at = ?,
-                    updated_at = ?, error = ''
+                    updated_at = ?, error = '', lease_owner = ?, heartbeat_at = ?,
+                    finished_at = NULL
                 WHERE id = ? AND status = 'queued'
                 """,
-                (now, now, row["id"]),
+                (now, now, worker_id, now, row["id"]),
             )
             if updated.rowcount != 1:
                 return None
-        self.add_event("task.started", "执行器已领取任务", row["id"])
+        self.add_event(
+            "task.started",
+            "执行器已领取任务",
+            row["id"],
+            {"worker_id": worker_id},
+        )
         return self.get_task(row["id"])
 
-    def update_task(self, task_id: str, **values: Any) -> dict[str, Any]:
+    def heartbeat_task(self, task_id: str, worker_id: str) -> bool:
+        now = utc_now()
+        with self.connect() as db:
+            updated = db.execute(
+                """
+                UPDATE tasks SET heartbeat_at = ?, updated_at = ?
+                WHERE id = ? AND status = 'running' AND lease_owner = ?
+                """,
+                (now, now, task_id, worker_id),
+            )
+        return updated.rowcount == 1
+
+    def recover_stale_tasks(self, stale_before: str) -> int:
+        recovered: list[tuple[str, str]] = []
+        now = utc_now()
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            rows = db.execute(
+                """
+                SELECT id, attempts, max_attempts FROM tasks
+                WHERE status = 'running'
+                  AND (heartbeat_at IS NULL OR heartbeat_at < ?)
+                """,
+                (stale_before,),
+            ).fetchall()
+            for row in rows:
+                retry = row["attempts"] < row["max_attempts"]
+                status = "queued" if retry else "failed"
+                error = "执行器心跳超时，任务已回收"
+                db.execute(
+                    """
+                    UPDATE tasks SET status = ?, lease_owner = '', heartbeat_at = NULL,
+                        error = ?, updated_at = ?, finished_at = ?
+                    WHERE id = ? AND status = 'running'
+                    """,
+                    (status, error, now, None if retry else now, row["id"]),
+                )
+                recovered.append((row["id"], status))
+        for task_id, status in recovered:
+            self.add_event(
+                "task.recovered" if status == "queued" else "task.failed",
+                "执行器心跳超时，任务已重新排队"
+                if status == "queued"
+                else "执行器心跳超时，已达到重试上限",
+                task_id,
+            )
+        return len(recovered)
+
+    def update_task(
+        self,
+        task_id: str,
+        *,
+        expected_lease_owner: str | None = None,
+        **values: Any,
+    ) -> dict[str, Any]:
         safe_values = {key: value for key, value in values.items() if key in TASK_FIELDS}
         if not safe_values:
             task = self.get_task(task_id)
@@ -217,26 +290,54 @@ class Database:
             return task
         safe_values["updated_at"] = utc_now()
         assignments = ", ".join(f"{key} = ?" for key in safe_values)
+        where = "id = ?"
+        parameters = [*safe_values.values(), task_id]
+        if expected_lease_owner is not None:
+            where += " AND status = 'running' AND lease_owner = ?"
+            parameters.append(expected_lease_owner)
         with self.connect() as db:
-            db.execute(
-                f"UPDATE tasks SET {assignments} WHERE id = ?",
-                (*safe_values.values(), task_id),
+            updated = db.execute(
+                f"UPDATE tasks SET {assignments} WHERE {where}",
+                parameters,
             )
+        if expected_lease_owner is not None and updated.rowcount != 1:
+            raise LeaseLostError(f"任务 {task_id} 的执行租约已失效")
         task = self.get_task(task_id)
         if task is None:
             raise KeyError(task_id)
         return task
 
-    def complete_task(self, task_id: str) -> dict[str, Any]:
+    def complete_task(
+        self,
+        task_id: str,
+        ready_for_review: bool = True,
+        lease_owner: str | None = None,
+    ) -> dict[str, Any]:
+        status = "awaiting_approval" if ready_for_review else "needs_revision"
         task = self.update_task(
             task_id,
-            status="awaiting_approval",
+            expected_lease_owner=lease_owner,
+            status=status,
             finished_at=utc_now(),
+            lease_owner="",
+            heartbeat_at=None,
         )
-        self.add_event("task.completed", "执行完成，等待人工审批", task_id)
+        self.add_event(
+            "task.completed",
+            "执行完成，等待人工审批"
+            if ready_for_review
+            else "验证未通过，需要修改后重试",
+            task_id,
+            {"verification_status": task["verification_status"]},
+        )
         return task
 
-    def fail_task(self, task_id: str, message: str) -> dict[str, Any]:
+    def fail_task(
+        self,
+        task_id: str,
+        message: str,
+        lease_owner: str | None = None,
+    ) -> dict[str, Any]:
         task = self.get_task(task_id)
         if task is None:
             raise KeyError(task_id)
@@ -244,9 +345,12 @@ class Database:
         status = "queued" if retry else "failed"
         result = self.update_task(
             task_id,
+            expected_lease_owner=lease_owner,
             status=status,
             error=message[:2000],
             finished_at=utc_now() if not retry else None,
+            lease_owner="",
+            heartbeat_at=None,
         )
         event_message = "执行失败，已重新排队" if retry else "执行失败，已达到重试上限"
         self.add_event("task.failed", event_message, task_id, {"error": message[:500]})
@@ -271,7 +375,7 @@ class Database:
         task = self.get_task(task_id)
         if task is None:
             raise KeyError(task_id)
-        if task["status"] not in {"failed", "rejected"}:
+        if task["status"] not in {"failed", "rejected", "needs_revision"}:
             raise ValueError("当前任务状态不允许重试")
         with self.connect() as db:
             db.execute(
@@ -280,7 +384,8 @@ class Database:
                     plan = '', implementation = '', review = '', verification = '',
                     diff = '', test_output = '', execution_log = '', executor_mode = '',
                     worktree_path = '', codex_session_id = '', input_tokens = 0,
-                    output_tokens = 0, started_at = NULL, finished_at = NULL,
+                    output_tokens = 0, verification_status = '', lease_owner = '',
+                    heartbeat_at = NULL, started_at = NULL, finished_at = NULL,
                     updated_at = ? WHERE id = ?
                 """,
                 (utc_now(), task_id),

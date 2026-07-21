@@ -48,12 +48,25 @@ class Settings:
     codex_path: str = find_codex()
     codex_enabled: bool = env_bool("LILY_USE_CODEX", True)
     codex_timeout: int = int(os.getenv("LILY_CODEX_TIMEOUT", "900"))
+    codex_env_allowlist: tuple[str, ...] = tuple(
+        item.strip()
+        for item in os.getenv("LILY_CODEX_ENV_ALLOWLIST", "").split(",")
+        if item.strip()
+    )
     allowed_repo_root: Path = Path(
         os.getenv("LILY_ALLOWED_REPO_ROOT", str(Path.home()))
     ).expanduser().resolve()
     worktree_root: Path = ROOT / os.getenv("LILY_WORKTREE_DIR", "lily-worktrees")
     worker_interval: float = float(os.getenv("LILY_WORKER_INTERVAL", "2"))
+    heartbeat_interval: float = float(os.getenv("LILY_HEARTBEAT_INTERVAL", "10"))
+    lease_timeout: float = float(os.getenv("LILY_LEASE_TIMEOUT", "60"))
     max_attempts: int = int(os.getenv("LILY_MAX_ATTEMPTS", "3"))
+
+    def __post_init__(self) -> None:
+        if self.heartbeat_interval <= 0:
+            raise ValueError("LILY_HEARTBEAT_INTERVAL 必须大于 0")
+        if self.lease_timeout <= self.heartbeat_interval:
+            raise ValueError("LILY_LEASE_TIMEOUT 必须大于 LILY_HEARTBEAT_INTERVAL")
 
 
 settings = Settings()

@@ -44,6 +44,24 @@ STAGES = (
     ),
 )
 
+CODEX_BASE_ENV = {
+    "HOME",
+    "PATH",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "SHELL",
+    "USER",
+    "LOGNAME",
+    "TERM",
+    "COLORTERM",
+    "NO_COLOR",
+    "CODEX_HOME",
+}
+
 
 @dataclass
 class StageResult:
@@ -76,6 +94,14 @@ def is_within(path: Path, root: Path) -> bool:
         return True
     except ValueError:
         return False
+
+
+def codex_environment(
+    source: dict[str, str],
+    extra_allowlist: tuple[str, ...] = (),
+) -> dict[str, str]:
+    allowed = CODEX_BASE_ENV | set(extra_allowlist)
+    return {key: value for key, value in source.items() if key in allowed}
 
 
 async def run_process(
@@ -148,12 +174,14 @@ class CodexCliExecutor:
         worktree_root: Path,
         schema_path: Path,
         timeout: int,
+        env_allowlist: tuple[str, ...] = (),
     ):
         self.codex_path = codex_path
         self.allowed_repo_root = allowed_repo_root.resolve()
         self.worktree_root = worktree_root
         self.schema_path = schema_path
         self.timeout = timeout
+        self.env_allowlist = env_allowlist
 
     @property
     def available(self) -> bool:
@@ -180,9 +208,7 @@ class CodexCliExecutor:
             str(result_file),
             prompt,
         ]
-        environment = dict(os.environ)
-        environment.pop("OPENAI_API_KEY", None)
-        environment.pop("CODEX_API_KEY", None)
+        environment = codex_environment(dict(os.environ), self.env_allowlist)
         code, stdout, stderr = await run_process(
             *command,
             cwd=worktree,
@@ -246,7 +272,10 @@ class CodexCliExecutor:
             verification,
             input_tokens=usage[0],
             output_tokens=usage[1],
-            metadata={"test_output": test_output},
+            metadata={
+                "test_output": test_output,
+                "verification_status": verdict,
+            },
         )
 
     async def _resolve_repo(self, value: str) -> Path:
@@ -369,17 +398,24 @@ Issue：{task.get('issue_url') or '未提供'}
                 commands.append(item)
         return commands
 
-    def _execution_log(self, events: list[dict[str, Any]], stderr: str, exit_code: int) -> str:
+    def _execution_log(
+        self,
+        events: list[dict[str, Any]],
+        stderr: str,
+        process_exit_code: int,
+    ) -> str:
         lines: list[str] = []
         for item in self._command_events(events):
             command = item.get("command", "")
             status = item.get("status", "completed")
-            exit_code = item.get("exit_code")
-            lines.append(f"$ {command}\nstatus={status} exit_code={exit_code}")
+            command_exit_code = item.get("exit_code")
+            lines.append(
+                f"$ {command}\nstatus={status} exit_code={command_exit_code}"
+            )
             output = item.get("aggregated_output") or item.get("output") or ""
             if output:
                 lines.append(str(output)[-3000:])
-        if exit_code != 0 and stderr.strip():
+        if process_exit_code != 0 and stderr.strip():
             lines.append("[codex stderr]\n" + stderr[-5000:])
         return "\n\n".join(lines)[-50000:]
 
@@ -421,6 +457,7 @@ class TaskExecutor:
             settings.worktree_root,
             settings.root / "codex-result.schema.json",
             settings.codex_timeout,
+            getattr(settings, "codex_env_allowlist", ()),
         ) if settings.codex_enabled else None
 
     @property

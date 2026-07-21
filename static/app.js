@@ -12,6 +12,7 @@ const statusLabels = {
   queued: "排队中",
   running: "执行中",
   awaiting_approval: "等待审批",
+  needs_revision: "需要修改",
   approved: "已通过",
   failed: "失败",
   rejected: "已驳回",
@@ -33,6 +34,8 @@ const eventLabels = {
   "stage.completed": "阶段完成",
   "task.completed": "等待审批",
   "task.failed": "执行失败",
+  "task.recovered": "任务恢复",
+  "task.lease_lost": "租约失效",
   "task.approved": "审批通过",
   "task.rejected": "审批驳回",
   "task.retried": "任务重试",
@@ -233,7 +236,7 @@ function renderDetail() {
   const availableStages = Object.keys(stageLabels).filter((key) => task[key] || ["plan", "implementation", "review", "verification"].includes(key));
   const actions = task.status === "awaiting_approval"
     ? `<button class="button button-danger" data-detail-action="reject">驳回</button><button class="button button-success" data-detail-action="approve">审批通过</button>`
-    : ["failed", "rejected"].includes(task.status)
+    : ["failed", "rejected", "needs_revision"].includes(task.status)
       ? `<button class="button button-primary" data-detail-action="retry">重新排队</button>`
       : "";
 
