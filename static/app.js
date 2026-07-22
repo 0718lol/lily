@@ -40,6 +40,7 @@ const eventLabels = {
   "task.rejected": "审批驳回",
   "task.retried": "任务重试",
   "codex.started": "Codex 执行",
+  "runtime.started": "Agent 执行",
   "system.paused": "循环暂停",
   "system.resumed": "循环恢复",
 };
@@ -119,11 +120,43 @@ function renderMetrics() {
 function renderRuntime() {
   const labels = {
     "codex-cli": "Codex CLI 在线",
+    "claude-code": "Claude Code 在线",
     openai: "OpenAI 在线",
     demo: "演示模式",
   };
   $("#runtimeMode").textContent = labels[state.dashboard.mode] || "执行器离线";
-  $("#runtimeModel").textContent = state.dashboard.model || "-";
+  const runtimes = state.dashboard.runtimes || [];
+  const online = runtimes.filter((runtime) => (
+    runtime.available && runtime.id !== "demo"
+  ));
+  $("#runtimeModel").textContent = `${online.length} 个 Agent 可用`;
+  const runtimeStatusLabels = {
+    configured: "已配置",
+    installed: "已安装",
+    ready: "可用",
+    not_configured: "未配置",
+    not_installed: "未安装",
+  };
+  $("#runtimeList").innerHTML = runtimes
+    .filter((runtime) => runtime.id !== "demo")
+    .map((runtime) => `
+      <div class="runtime-item" title="${escapeHtml(`${runtime.config_source || ""} · connectivity: ${runtime.connectivity || "unknown"}`)}">
+        <i class="runtime-health ${runtime.available ? "is-available" : ""}"></i>
+        <div class="runtime-copy">
+          <strong>${escapeHtml(runtime.name)} · ${escapeHtml(runtimeStatusLabels[runtime.status] || runtime.status)}</strong>
+          <span>${escapeHtml(runtime.provider || "-")} · ${escapeHtml(runtime.model || "-")}</span>
+        </div>
+      </div>
+    `).join("");
+  const availability = new Map(
+    runtimes.map((runtime) => [runtime.id, runtime.available])
+  );
+  $$('#taskForm select[name="runtime_requested"] option').forEach((option) => {
+    option.dataset.label ||= option.textContent;
+    const alwaysAvailable = ["auto", "demo"].includes(option.value);
+    option.disabled = !alwaysAvailable && availability.get(option.value) === false;
+    option.textContent = `${option.dataset.label}${option.disabled ? "（不可用）" : ""}`;
+  });
   $("#runtimeDot").classList.toggle("is-live", !state.dashboard.paused);
 }
 
@@ -141,7 +174,7 @@ function renderTasks() {
     <div class="task-row" role="row" data-task-id="${escapeHtml(task.id)}" tabindex="0">
       <div class="task-name">
         <strong>${escapeHtml(task.title)}</strong>
-        <span>${escapeHtml(task.repository || task.repository_path || task.issue_url || "本地任务")}</span>
+        <span>${escapeHtml(task.repository || task.repository_path || task.issue_url || "本地任务")} · ${escapeHtml(task.executor_mode || task.runtime_requested || "auto")}</span>
       </div>
       <span class="badge status-${escapeHtml(task.status)}">${escapeHtml(statusLabels[task.status] || task.status)}</span>
       <span class="priority priority-P${task.priority}">P${task.priority}</span>
@@ -251,9 +284,13 @@ function renderDetail() {
     <div class="detail-meta">
       <span>仓库：${escapeHtml(task.repository || "未提供")}</span>
       <span>执行器：${escapeHtml(task.executor_mode || "等待分配")}</span>
+      <span>请求运行时：${escapeHtml(task.runtime_requested || "auto")}</span>
+      ${task.runtime_provider ? `<span>Provider：${escapeHtml(task.runtime_provider)}</span>` : ""}
+      ${task.runtime_model ? `<span>模型：${escapeHtml(task.runtime_model)}</span>` : ""}
       <span>风险：${escapeHtml(task.risk)}</span>
       <span>尝试：${task.attempts}/${task.max_attempts}</span>
       <span>Token：${formatNumber(task.input_tokens + task.output_tokens)}</span>
+      ${task.cost_usd ? `<span>费用：$${Number(task.cost_usd).toFixed(4)}</span>` : ""}
       ${task.worktree_path ? `<span class="meta-wide">工作树：${escapeHtml(task.worktree_path)}</span>` : ""}
     </div>
     <div class="detail-description">${escapeHtml(task.description)}</div>

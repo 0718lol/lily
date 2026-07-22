@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Lily OpenMaintainer human-in-the-loop maintenance console">
   <title>Lily OpenMaintainer</title>
-  <link rel="stylesheet" href="/static/style.css?v=0.2.1">
+  <link rel="stylesheet" href="/static/style.css?v=0.4.1">
 </head>
 <body>
   <div class="app-shell">
@@ -41,6 +41,7 @@
           <strong id="runtimeMode">检查中</strong>
         </div>
         <span id="runtimeModel">-</span>
+        <div class="runtime-list" id="runtimeList"></div>
       </div>
     </aside>
 
@@ -129,7 +130,7 @@
         <div class="section-head">
           <div>
             <h2>人工审批</h2>
-            <p>所有模型结果都在这里停止，直到你作出决定。</p>
+            <p>通过验证闸门的结果会停在这里，直到你作出决定。</p>
           </div>
         </div>
         <div class="approval-list" id="approvalList"></div>
@@ -191,6 +192,16 @@
           </select>
         </label>
         <label class="field field-wide">
+          <span>Agent 运行时</span>
+          <select name="runtime_requested">
+            <option value="auto" selected>自动选择</option>
+            <option value="codex-cli">Codex CLI</option>
+            <option value="claude-code">Claude Code</option>
+            <option value="openai">OpenAI Responses</option>
+            <option value="demo">演示模式</option>
+          </select>
+        </label>
+        <label class="field field-wide">
           <span>任务描述</span>
           <textarea name="description" required minlength="10" maxlength="8000" rows="7" placeholder="描述现状、目标、约束和验收条件。"></textarea>
         </label>
@@ -209,6 +220,6 @@
   </dialog>
 
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
-  <script src="/static/app.js?v=0.2.1" defer></script>
+  <script src="/static/app.js?v=0.4.1" defer></script>
 </body>
 </html>

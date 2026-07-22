@@ -1,16 +1,24 @@
 import asyncio
+import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 from agent import (
+    ClaudeCodeExecutor,
     CodexCliExecutor,
     TaskExecutor,
+    claude_environment,
     codex_environment,
     extract_output_text,
+    parse_json_object,
+    validate_maintenance_result,
 )
 from database import Database, LeaseLostError
+from config import claude_profile
 
 
 class ResponseParsingTests(unittest.TestCase):
@@ -104,6 +112,131 @@ class ResponseParsingTests(unittest.TestCase):
         self.assertIn("[codex stderr]", log)
         self.assertIn("fatal process error", log)
 
+    def test_parses_and_validates_claude_result(self):
+        value = {
+            "plan": ["inspect", "change"],
+            "summary": "updated parser",
+            "files_changed": ["parser.py"],
+            "review_findings": [],
+            "verification_status": "READY_FOR_HUMAN_REVIEW",
+            "verification_notes": "tests passed",
+            "tests": [],
+        }
+        events = [
+            {
+                "type": "result",
+                "session_id": "claude-session",
+                "result": f"```json\n{__import__('json').dumps(value)}\n```",
+                "usage": {"input_tokens": 80, "output_tokens": 20},
+                "total_cost_usd": 0.04,
+            }
+        ]
+        parsed = ClaudeCodeExecutor._claude_result(events)
+        self.assertEqual(validate_maintenance_result(parsed), value)
+        self.assertEqual(
+            ClaudeCodeExecutor._claude_usage(events),
+            (80, 20, 0.04),
+        )
+        self.assertEqual(
+            ClaudeCodeExecutor._claude_session_id(events),
+            "claude-session",
+        )
+
+    def test_claude_environment_is_isolated(self):
+        environment = claude_environment(
+            {
+                "HOME": "/tmp/home",
+                "PATH": "/usr/bin",
+                "ANTHROPIC_API_KEY": "secret",
+                "GITHUB_TOKEN": "secret",
+                "CLAUDE_TEST_TOKEN": "allowed",
+            },
+            ("CLAUDE_TEST_TOKEN",),
+        )
+        self.assertNotIn("ANTHROPIC_API_KEY", environment)
+        self.assertNotIn("GITHUB_TOKEN", environment)
+        self.assertEqual(environment["CLAUDE_TEST_TOKEN"], "allowed")
+        self.assertEqual(environment["DISABLE_AUTOUPDATER"], "1")
+
+    def test_runtime_selection_is_explicit(self):
+        runtime = self._runtime_settings()
+        runtime.codex_path = "/tmp/missing-codex"
+        runtime.claude_path = "/tmp/missing-claude"
+        executor = TaskExecutor(runtime)
+        task = {
+            "repository_path": "/tmp/repository",
+            "runtime_requested": "claude-code",
+        }
+        with self.assertRaisesRegex(ValueError, "当前不可用"):
+            executor.resolve_mode(task)
+        task["runtime_requested"] = "auto"
+        self.assertEqual(executor.resolve_mode(task), "demo")
+
+    def test_claude_runtime_diagnostics_show_provider_and_model(self):
+        with tempfile.TemporaryDirectory() as directory:
+            executable = Path(directory) / "claude"
+            executable.write_text("#!/bin/sh\n", encoding="utf-8")
+            runtime = self._runtime_settings()
+            runtime.claude_path = str(executable)
+            runtime.claude_provider = "Domestic Gateway"
+            runtime.claude_model = "glm-example"
+            runtime.claude_api_host = "gateway.example.cn"
+            runtime.claude_config_source = "Claude settings.json"
+            runtime.claude_auth_configured = True
+
+            diagnostics = TaskExecutor(runtime).runtime_info("claude-code")
+
+        self.assertTrue(diagnostics["available"])
+        self.assertEqual(diagnostics["status"], "configured")
+        self.assertEqual(diagnostics["provider"], "Domestic Gateway")
+        self.assertEqual(diagnostics["model"], "glm-example")
+        self.assertNotIn("token", json.dumps(diagnostics).lower())
+
+    def test_reads_safe_metadata_from_claude_settings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings_path = Path(directory) / "settings.json"
+            settings_path.write_text(
+                json.dumps({
+                    "env": {
+                        "ANTHROPIC_BASE_URL": "https://api.example.cn/v1",
+                        "ANTHROPIC_AUTH_TOKEN": "super-secret",
+                        "ANTHROPIC_MODEL": "qwen-example",
+                    }
+                }),
+                encoding="utf-8",
+            )
+            environment = {
+                "HOME": directory,
+                "LILY_CLAUDE_CONFIG_PATH": str(settings_path),
+            }
+            with mock.patch.dict(os.environ, environment, clear=True):
+                profile = claude_profile()
+
+        self.assertEqual(profile["provider"], "api.example.cn")
+        self.assertEqual(profile["model"], "qwen-example")
+        self.assertEqual(profile["api_host"], "api.example.cn")
+        self.assertTrue(profile["auth_configured"])
+        self.assertNotIn("super-secret", repr(profile))
+
+    @staticmethod
+    def _runtime_settings():
+        return SimpleNamespace(
+            openai_api_key="",
+            openai_model="demo",
+            codex_path="",
+            codex_enabled=True,
+            codex_timeout=30,
+            claude_path="",
+            claude_enabled=True,
+            claude_timeout=30,
+            claude_max_turns=3,
+            claude_allowed_tools=("Read",),
+            runtime_priority=("codex-cli", "claude-code"),
+            allowed_repo_root=Path(tempfile.gettempdir()),
+            worktree_root=Path(tempfile.gettempdir()) / "lily-test-worktrees",
+            root=Path(tempfile.gettempdir()),
+        )
+
 
 class DatabaseTests(unittest.TestCase):
     def setUp(self):
@@ -131,11 +264,14 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(claimed["id"], created["id"])
         self.assertEqual(claimed["status"], "running")
         self.assertEqual(claimed["repository_path"], "/tmp/demo-project")
+        self.assertEqual(claimed["runtime_requested"], "auto")
 
         self.db.update_task(
             created["id"],
             expected_lease_owner="worker-a",
             plan="plan result",
+            runtime_provider="OpenAI",
+            runtime_model="codex",
         )
         completed = self.db.complete_task(
             created["id"],
@@ -143,6 +279,8 @@ class DatabaseTests(unittest.TestCase):
             lease_owner="worker-a",
         )
         self.assertEqual(completed["status"], "awaiting_approval")
+        self.assertEqual(completed["runtime_provider"], "OpenAI")
+        self.assertEqual(completed["runtime_model"], "codex")
 
         approved = self.db.set_decision(created["id"], True)
         self.assertEqual(approved["status"], "approved")
@@ -198,6 +336,7 @@ class DatabaseTests(unittest.TestCase):
                 "issue_url": "",
                 "priority": 1,
                 "risk": "low",
+                "runtime_requested": "claude-code",
             },
             max_attempts=3,
         )

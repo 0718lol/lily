@@ -18,6 +18,11 @@ TASK_FIELDS = {
     "test_output",
     "execution_log",
     "executor_mode",
+    "runtime_requested",
+    "runtime_session_id",
+    "runtime_provider",
+    "runtime_model",
+    "cost_usd",
     "worktree_path",
     "codex_session_id",
     "lease_owner",
@@ -80,6 +85,11 @@ class Database:
                     test_output TEXT NOT NULL DEFAULT '',
                     execution_log TEXT NOT NULL DEFAULT '',
                     executor_mode TEXT NOT NULL DEFAULT '',
+                    runtime_requested TEXT NOT NULL DEFAULT 'auto',
+                    runtime_session_id TEXT NOT NULL DEFAULT '',
+                    runtime_provider TEXT NOT NULL DEFAULT '',
+                    runtime_model TEXT NOT NULL DEFAULT '',
+                    cost_usd REAL NOT NULL DEFAULT 0,
                     worktree_path TEXT NOT NULL DEFAULT '',
                     codex_session_id TEXT NOT NULL DEFAULT '',
                     lease_owner TEXT NOT NULL DEFAULT '',
@@ -121,6 +131,11 @@ class Database:
                 "test_output": "TEXT NOT NULL DEFAULT ''",
                 "execution_log": "TEXT NOT NULL DEFAULT ''",
                 "executor_mode": "TEXT NOT NULL DEFAULT ''",
+                "runtime_requested": "TEXT NOT NULL DEFAULT 'auto'",
+                "runtime_session_id": "TEXT NOT NULL DEFAULT ''",
+                "runtime_provider": "TEXT NOT NULL DEFAULT ''",
+                "runtime_model": "TEXT NOT NULL DEFAULT ''",
+                "cost_usd": "REAL NOT NULL DEFAULT 0",
                 "worktree_path": "TEXT NOT NULL DEFAULT ''",
                 "codex_session_id": "TEXT NOT NULL DEFAULT ''",
                 "lease_owner": "TEXT NOT NULL DEFAULT ''",
@@ -156,8 +171,9 @@ class Database:
                 """
                 INSERT INTO tasks(
                     id, title, repository, repository_path, issue_url, description,
-                    priority, risk, max_attempts, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    priority, risk, runtime_requested, max_attempts, created_at,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task_id,
@@ -168,6 +184,7 @@ class Database:
                     payload["description"].strip(),
                     payload.get("priority", 2),
                     payload.get("risk", "low"),
+                    payload.get("runtime_requested", "auto"),
                     max_attempts,
                     now,
                     now,
@@ -383,8 +400,10 @@ class Database:
                 UPDATE tasks SET status = 'queued', attempts = 0, error = '',
                     plan = '', implementation = '', review = '', verification = '',
                     diff = '', test_output = '', execution_log = '', executor_mode = '',
-                    worktree_path = '', codex_session_id = '', input_tokens = 0,
-                    output_tokens = 0, verification_status = '', lease_owner = '',
+                    worktree_path = '', codex_session_id = '', runtime_session_id = '',
+                    runtime_provider = '', runtime_model = '', cost_usd = 0,
+                    input_tokens = 0, output_tokens = 0,
+                    verification_status = '', lease_owner = '',
                     heartbeat_at = NULL, started_at = NULL, finished_at = NULL,
                     updated_at = ? WHERE id = ?
                 """,
@@ -425,7 +444,12 @@ class Database:
                 for row in db.execute("SELECT status, COUNT(*) AS count FROM tasks GROUP BY status")
             }
             usage = db.execute(
-                "SELECT COALESCE(SUM(input_tokens), 0) AS input, COALESCE(SUM(output_tokens), 0) AS output FROM tasks"
+                """
+                SELECT COALESCE(SUM(input_tokens), 0) AS input,
+                       COALESCE(SUM(output_tokens), 0) AS output,
+                       COALESCE(SUM(cost_usd), 0) AS cost
+                FROM tasks
+                """
             ).fetchone()
         return {
             "counts": counts,
@@ -436,5 +460,6 @@ class Database:
             "failed": counts.get("failed", 0),
             "input_tokens": usage["input"],
             "output_tokens": usage["output"],
+            "cost_usd": usage["cost"],
             "paused": self.is_paused(),
         }

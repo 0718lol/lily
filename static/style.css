@@ -108,6 +108,14 @@ button { cursor: pointer; }
 .runtime-row { display: flex; align-items: center; gap: 8px; margin: 9px 0 5px; color: #fff; }
 .status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--amber); box-shadow: 0 0 0 4px rgba(223,243,106,.08); }
 .status-dot.is-live { background: #72d89f; }
+.runtime-list { display: grid; gap: 9px; margin-top: 14px; }
+.runtime-item { display: grid; grid-template-columns: 7px minmax(0, 1fr); gap: 8px; align-items: start; }
+.runtime-health { width: 7px; height: 7px; margin-top: 4px; border-radius: 50%; background: #737a75; }
+.runtime-health.is-available { background: #72d89f; }
+.runtime-copy { min-width: 0; }
+.runtime-copy strong, .runtime-copy span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.runtime-copy strong { color: #fff; font-size: 11px; }
+.runtime-copy span { margin-top: 2px; color: var(--sidebar-muted); font-size: 10px; }
 
 .main { min-width: 0; padding: 28px 32px 40px; }
 

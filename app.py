@@ -28,6 +28,10 @@ class TaskCreate(BaseModel):
     issue_url: str = Field(default="", max_length=1000)
     priority: int = Field(default=2, ge=1, le=3)
     risk: str = Field(default="low", pattern="^(low|medium|high)$")
+    runtime_requested: str = Field(
+        default="auto",
+        pattern="^(auto|codex-cli|claude-code|openai|demo)$",
+    )
 
 
 class PauseRequest(BaseModel):
@@ -70,14 +74,23 @@ async def process_task(task: dict[str, Any]) -> None:
     heartbeat = asyncio.create_task(heartbeat_loop(task["id"]))
     try:
         mode = executor.resolve_mode(task)
+        runtime_info = executor.runtime_info(mode)
         db.update_task(
             task["id"],
             expected_lease_owner=worker_id,
             executor_mode=mode,
+            runtime_provider=runtime_info["provider"],
+            runtime_model=runtime_info["model"],
         )
-        if mode == "codex-cli":
-            db.add_event("codex.started", "Codex 已在隔离工作树中开始执行", task["id"])
-            await broadcast("codex.started")
+        if mode in executor.adapters:
+            runtime_name = executor.adapters[mode].display_name
+            db.add_event(
+                "runtime.started",
+                f"{runtime_name} 已在隔离工作树中开始执行",
+                task["id"],
+                {"runtime": mode},
+            )
+            await broadcast("runtime.started")
         async for result in executor.run(task):
             total_input += result.input_tokens
             total_output += result.output_tokens
@@ -150,7 +163,7 @@ async def lifespan(_: FastAPI):
             await task
 
 
-app = FastAPI(title="Lily OpenMaintainer", version="0.3.0", lifespan=lifespan)
+app = FastAPI(title="Lily OpenMaintainer", version="0.4.1", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=settings.root / "static"), name="static")
 
 
@@ -166,6 +179,8 @@ async def health():
         "mode": executor.mode,
         "model": executor.model_label,
         "codex_available": bool(executor.codex and executor.codex.available),
+        "claude_available": bool(executor.claude and executor.claude.available),
+        "runtimes": executor.runtime_statuses(),
         "paused": db.is_paused(),
     }
 
@@ -177,9 +192,19 @@ async def dashboard():
         "mode": executor.mode,
         "model": executor.model_label,
         "codex_available": bool(executor.codex and executor.codex.available),
+        "claude_available": bool(executor.claude and executor.claude.available),
+        "runtimes": executor.runtime_statuses(),
         "allowed_repo_root": str(settings.allowed_repo_root),
     })
     return payload
+
+
+@app.get("/api/runtimes")
+async def runtimes():
+    return {
+        "default": executor.mode,
+        "runtimes": executor.runtime_statuses(),
+    }
 
 
 @app.get("/api/tasks")
@@ -197,7 +222,12 @@ async def get_task(task_id: str):
 
 @app.post("/api/tasks", status_code=201)
 async def create_task(payload: TaskCreate):
-    task = db.create_task(payload.model_dump(), settings.max_attempts)
+    values = payload.model_dump()
+    try:
+        executor.resolve_mode(values)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    task = db.create_task(values, settings.max_attempts)
     await broadcast("task.created")
     return task
 

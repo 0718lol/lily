@@ -6,7 +6,7 @@ import os
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Protocol
 
 import httpx
 
@@ -62,6 +62,14 @@ CODEX_BASE_ENV = {
     "CODEX_HOME",
 }
 
+CLAUDE_BASE_ENV = CODEX_BASE_ENV | {
+    "CLAUDE_CONFIG_DIR",
+    "SSL_CERT_FILE",
+    "NODE_EXTRA_CA_CERTS",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+}
+
 
 @dataclass
 class StageResult:
@@ -71,6 +79,18 @@ class StageResult:
     input_tokens: int = 0
     output_tokens: int = 0
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
+class RuntimeAdapter(Protocol):
+    runtime_id: str
+    display_name: str
+
+    @property
+    def available(self) -> bool: ...
+
+    def diagnostics(self) -> dict[str, Any]: ...
+
+    async def run(self, task: dict[str, Any]) -> AsyncIterator[StageResult]: ...
 
 
 def extract_output_text(payload: dict[str, Any]) -> str:
@@ -102,6 +122,55 @@ def codex_environment(
 ) -> dict[str, str]:
     allowed = CODEX_BASE_ENV | set(extra_allowlist)
     return {key: value for key, value in source.items() if key in allowed}
+
+
+def claude_environment(
+    source: dict[str, str],
+    extra_allowlist: tuple[str, ...] = (),
+) -> dict[str, str]:
+    allowed = CLAUDE_BASE_ENV | set(extra_allowlist)
+    environment = {key: value for key, value in source.items() if key in allowed}
+    environment["DISABLE_AUTOUPDATER"] = "1"
+    return environment
+
+
+def parse_json_object(text: str) -> dict[str, Any]:
+    candidate = text.strip()
+    if candidate.startswith("```"):
+        lines = candidate.splitlines()
+        candidate = "\n".join(lines[1:-1]).strip()
+    decoder = json.JSONDecoder()
+    for index, character in enumerate(candidate):
+        if character != "{":
+            continue
+        try:
+            value, _ = decoder.raw_decode(candidate[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            return value
+    raise RuntimeError("运行时未返回有效的结构化 JSON 结果")
+
+
+def validate_maintenance_result(value: dict[str, Any]) -> dict[str, Any]:
+    required = {
+        "plan": list,
+        "summary": str,
+        "files_changed": list,
+        "review_findings": list,
+        "verification_status": str,
+        "verification_notes": str,
+        "tests": list,
+    }
+    for key, expected_type in required.items():
+        if not isinstance(value.get(key), expected_type):
+            raise RuntimeError(f"运行时结果字段 {key} 缺失或类型错误")
+    if value["verification_status"] not in {
+        "READY_FOR_HUMAN_REVIEW",
+        "NEEDS_REVISION",
+    }:
+        raise RuntimeError("运行时返回了无效的 verification_status")
+    return value
 
 
 async def run_process(
@@ -166,7 +235,109 @@ class OpenAIResponsesClient:
         return text, int(usage.get("input_tokens", 0)), int(usage.get("output_tokens", 0))
 
 
-class CodexCliExecutor:
+class GitWorktreeRuntime:
+    def __init__(
+        self,
+        allowed_repo_root: Path,
+        worktree_root: Path,
+    ):
+        self.allowed_repo_root = allowed_repo_root.resolve()
+        self.worktree_root = worktree_root
+
+    async def _resolve_repo(self, value: str) -> Path:
+        if not value.strip():
+            raise ValueError("真实执行需要填写本地仓库路径")
+        requested = Path(value).expanduser().resolve(strict=True)
+        if not is_within(requested, self.allowed_repo_root):
+            raise ValueError(f"仓库必须位于允许目录 {self.allowed_repo_root} 内")
+        code, stdout, stderr = await run_process(
+            "git",
+            "-C",
+            str(requested),
+            "rev-parse",
+            "--show-toplevel",
+            timeout=20,
+        )
+        if code != 0:
+            raise ValueError(f"路径不是 Git 仓库：{stderr.strip() or requested}")
+        root = Path(stdout.strip()).resolve()
+        if not is_within(root, self.allowed_repo_root):
+            raise ValueError("Git 仓库根目录不在允许范围内")
+        return root
+
+    async def _create_worktree(
+        self,
+        repo: Path,
+        task: dict[str, Any],
+    ) -> Path:
+        self.worktree_root.mkdir(parents=True, exist_ok=True)
+        suffix = uuid.uuid4().hex[:6]
+        worktree = (
+            self.worktree_root
+            / f"{task['id']}-a{task['attempts']}-{suffix}"
+        )
+        code, _, stderr = await run_process(
+            "git",
+            "-C",
+            str(repo),
+            "worktree",
+            "add",
+            "--detach",
+            str(worktree),
+            "HEAD",
+            timeout=60,
+        )
+        if code != 0:
+            raise RuntimeError(f"创建临时 Git 工作树失败：{stderr.strip()}")
+        return worktree
+
+    async def _collect_diff(
+        self,
+        worktree: Path,
+    ) -> tuple[str, str, str]:
+        await run_process(
+            "git", "-C", str(worktree), "add", "-N", ".", timeout=30
+        )
+        _, diff, _ = await run_process(
+            "git",
+            "-C",
+            str(worktree),
+            "diff",
+            "--no-ext-diff",
+            "--unified=3",
+            "--",
+            timeout=60,
+        )
+        _, status, _ = await run_process(
+            "git", "-C", str(worktree), "status", "--short", timeout=30
+        )
+        check_code, check_out, check_err = await run_process(
+            "git", "-C", str(worktree), "diff", "--check", timeout=30
+        )
+        check = (
+            "PASS"
+            if check_code == 0
+            else (check_out + check_err).strip()
+        )
+        return diff[:200000], status.strip(), check[:10000]
+
+    @staticmethod
+    def _parse_events(stdout: str) -> list[dict[str, Any]]:
+        events: list[dict[str, Any]] = []
+        for line in stdout.splitlines():
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, dict):
+                events.append(value)
+        return events
+
+
+class CodexCliExecutor(GitWorktreeRuntime):
+    runtime_id = "codex-cli"
+    display_name = "Codex CLI"
+
     def __init__(
         self,
         codex_path: str,
@@ -176,9 +347,8 @@ class CodexCliExecutor:
         timeout: int,
         env_allowlist: tuple[str, ...] = (),
     ):
+        super().__init__(allowed_repo_root, worktree_root)
         self.codex_path = codex_path
-        self.allowed_repo_root = allowed_repo_root.resolve()
-        self.worktree_root = worktree_root
         self.schema_path = schema_path
         self.timeout = timeout
         self.env_allowlist = env_allowlist
@@ -186,6 +356,19 @@ class CodexCliExecutor:
     @property
     def available(self) -> bool:
         return bool(self.codex_path and Path(self.codex_path).is_file())
+
+    def diagnostics(self) -> dict[str, Any]:
+        return {
+            "id": self.runtime_id,
+            "name": self.display_name,
+            "available": self.available,
+            "status": "installed" if self.available else "not_installed",
+            "provider": "OpenAI",
+            "model": "Codex saved login",
+            "api_host": "",
+            "config_source": "Codex configuration",
+            "connectivity": "unchecked",
+        }
 
     async def run(self, task: dict[str, Any]) -> AsyncIterator[StageResult]:
         repo = await self._resolve_repo(task["repository_path"])
@@ -221,7 +404,9 @@ class CodexCliExecutor:
             detail = execution_log[-4000:] or f"codex exec 退出码 {code}"
             raise RuntimeError(detail)
 
-        structured = self._read_result(result_file, events)
+        structured = validate_maintenance_result(
+            self._read_result(result_file, events)
+        )
         try:
             result_file.unlink()
         except OSError:
@@ -241,6 +426,8 @@ class CodexCliExecutor:
                 "executor_mode": "codex-cli",
                 "worktree_path": str(worktree),
                 "codex_session_id": thread_id,
+                "runtime_session_id": thread_id,
+                "cost_usd": 0,
             },
         )
 
@@ -278,55 +465,6 @@ class CodexCliExecutor:
             },
         )
 
-    async def _resolve_repo(self, value: str) -> Path:
-        if not value.strip():
-            raise ValueError("真实执行需要填写本地仓库路径")
-        requested = Path(value).expanduser().resolve(strict=True)
-        if not is_within(requested, self.allowed_repo_root):
-            raise ValueError(f"仓库必须位于允许目录 {self.allowed_repo_root} 内")
-        code, stdout, stderr = await run_process(
-            "git", "-C", str(requested), "rev-parse", "--show-toplevel", timeout=20
-        )
-        if code != 0:
-            raise ValueError(f"路径不是 Git 仓库：{stderr.strip() or requested}")
-        root = Path(stdout.strip()).resolve()
-        if not is_within(root, self.allowed_repo_root):
-            raise ValueError("Git 仓库根目录不在允许范围内")
-        return root
-
-    async def _create_worktree(self, repo: Path, task: dict[str, Any]) -> Path:
-        self.worktree_root.mkdir(parents=True, exist_ok=True)
-        suffix = uuid.uuid4().hex[:6]
-        worktree = self.worktree_root / f"{task['id']}-a{task['attempts']}-{suffix}"
-        code, _, stderr = await run_process(
-            "git",
-            "-C",
-            str(repo),
-            "worktree",
-            "add",
-            "--detach",
-            str(worktree),
-            "HEAD",
-            timeout=60,
-        )
-        if code != 0:
-            raise RuntimeError(f"创建临时 Git 工作树失败：{stderr.strip()}")
-        return worktree
-
-    async def _collect_diff(self, worktree: Path) -> tuple[str, str, str]:
-        await run_process("git", "-C", str(worktree), "add", "-N", ".", timeout=30)
-        _, diff, _ = await run_process(
-            "git", "-C", str(worktree), "diff", "--no-ext-diff", "--unified=3", "--", timeout=60
-        )
-        _, status, _ = await run_process(
-            "git", "-C", str(worktree), "status", "--short", timeout=30
-        )
-        check_code, check_out, check_err = await run_process(
-            "git", "-C", str(worktree), "diff", "--check", timeout=30
-        )
-        check = "PASS" if check_code == 0 else (check_out + check_err).strip()
-        return diff[:200000], status.strip(), check[:10000]
-
     def _prompt(self, task: dict[str, Any]) -> str:
         return f"""你正在 Lily 创建的隔离 Git worktree 中执行维护任务。
 
@@ -345,18 +483,6 @@ Issue：{task.get('issue_url') or '未提供'}
 6. 如果需求不安全、信息不足或无法验证，停止扩大修改并返回 NEEDS_REVISION。
 7. 最终严格按照输出 schema 返回结构化结果。
 """
-
-    @staticmethod
-    def _parse_events(stdout: str) -> list[dict[str, Any]]:
-        events: list[dict[str, Any]] = []
-        for line in stdout.splitlines():
-            try:
-                value = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(value, dict):
-                events.append(value)
-        return events
 
     @staticmethod
     def _read_result(path: Path, events: list[dict[str, Any]]) -> dict[str, Any]:
@@ -443,9 +569,275 @@ Issue：{task.get('issue_url') or '未提供'}
         return "\n\n".join(lines)[:50000]
 
 
+class ClaudeCodeExecutor(GitWorktreeRuntime):
+    runtime_id = "claude-code"
+    display_name = "Claude Code"
+
+    def __init__(
+        self,
+        claude_path: str,
+        allowed_repo_root: Path,
+        worktree_root: Path,
+        schema_path: Path,
+        timeout: int,
+        max_turns: int,
+        allowed_tools: tuple[str, ...],
+        env_allowlist: tuple[str, ...] = (),
+        provider: str = "Anthropic / Claude account",
+        model: str = "Claude Code default",
+        api_host: str = "",
+        config_source: str = "saved login / default",
+        auth_configured: bool = False,
+        config_path: str = "",
+    ):
+        super().__init__(allowed_repo_root, worktree_root)
+        self.claude_path = claude_path
+        self.schema_path = schema_path
+        self.timeout = timeout
+        self.max_turns = max_turns
+        self.allowed_tools = allowed_tools
+        self.env_allowlist = env_allowlist
+        self.provider = provider
+        self.model = model
+        self.api_host = api_host
+        self.config_source = config_source
+        self.auth_configured = auth_configured
+        self.config_path = config_path
+
+    @property
+    def available(self) -> bool:
+        return bool(
+            self.claude_path and Path(self.claude_path).is_file()
+        )
+
+    def diagnostics(self) -> dict[str, Any]:
+        configured = (
+            self.auth_configured
+            or self.api_host
+            or self.model != "Claude Code default"
+        )
+        return {
+            "id": self.runtime_id,
+            "name": self.display_name,
+            "available": self.available,
+            "status": "configured"
+            if self.available and configured
+            else "installed"
+            if self.available
+            else "not_installed",
+            "provider": self.provider,
+            "model": self.model,
+            "api_host": self.api_host,
+            "config_source": self.config_source,
+            "connectivity": "unchecked",
+        }
+
+    async def run(self, task: dict[str, Any]) -> AsyncIterator[StageResult]:
+        repo = await self._resolve_repo(task["repository_path"])
+        worktree = await self._create_worktree(repo, task)
+        command = [
+            self.claude_path,
+            "-p",
+            self._claude_prompt(task),
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--max-turns",
+            str(self.max_turns),
+            "--permission-mode",
+            "acceptEdits",
+        ]
+        if self.model != "Claude Code default":
+            command.extend(["--model", self.model])
+        if self.allowed_tools:
+            command.extend(["--allowedTools", ",".join(self.allowed_tools)])
+        environment = claude_environment(dict(os.environ), self.env_allowlist)
+        if self.config_path:
+            environment["CLAUDE_CONFIG_DIR"] = str(
+                Path(self.config_path).expanduser().parent
+            )
+        code, stdout, stderr = await run_process(
+            *command,
+            cwd=worktree,
+            timeout=self.timeout,
+            env=environment,
+        )
+        events = self._parse_events(stdout)
+        execution_log = self._claude_execution_log(events, stderr, code)
+        if code != 0:
+            detail = execution_log[-4000:] or f"claude 退出码 {code}"
+            raise RuntimeError(detail)
+
+        structured = validate_maintenance_result(
+            self._claude_result(events)
+        )
+        diff, status, diff_check = await self._collect_diff(worktree)
+        input_tokens, output_tokens, cost_usd = self._claude_usage(events)
+        session_id = self._claude_session_id(events)
+        runtime_metadata = {
+            "executor_mode": self.runtime_id,
+            "worktree_path": str(worktree),
+            "runtime_session_id": session_id,
+            "cost_usd": cost_usd,
+        }
+
+        plan = "\n".join(
+            f"{index}. {item}"
+            for index, item in enumerate(structured["plan"], 1)
+        ) or "Claude Code 未返回独立计划。"
+        yield StageResult(
+            "plan",
+            "Claude 规划",
+            plan,
+            metadata=runtime_metadata,
+        )
+
+        implementation = structured["summary"]
+        if structured["files_changed"]:
+            implementation += "\n\n### 修改文件\n" + "\n".join(
+                f"- `{item}`" for item in structured["files_changed"]
+            )
+        implementation += (
+            f"\n\n### Git 状态\n```text\n{status or '工作树无变化'}\n```"
+        )
+        yield StageResult(
+            "implementation",
+            "Claude 实现",
+            implementation,
+            metadata={"diff": diff, "execution_log": execution_log},
+        )
+
+        review = "\n".join(
+            f"- {item}" for item in structured["review_findings"]
+        ) or "Claude Code 未报告阻塞性审查问题。"
+        yield StageResult("review", "Claude 审查", review)
+
+        verdict = structured["verification_status"]
+        if not diff.strip():
+            verdict = "NEEDS_REVISION"
+        verification = (
+            f"{verdict}\n\n{structured['verification_notes']}"
+        ).strip()
+        yield StageResult(
+            "verification",
+            "Claude 验证",
+            verification,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            metadata={
+                "test_output": self._structured_test_output(
+                    structured["tests"], diff_check
+                ),
+                "verification_status": verdict,
+            },
+        )
+
+    def _claude_prompt(self, task: dict[str, Any]) -> str:
+        schema = self.schema_path.read_text(encoding="utf-8")
+        return f"""你正在 Lily 创建的隔离 Git worktree 中执行维护任务。
+
+任务标题：{task['title']}
+风险等级：{task['risk']}
+Issue：{task.get('issue_url') or '未提供'}
+任务描述：
+{task['description']}
+
+要求：
+1. 阅读仓库说明、CLAUDE.md、AGENTS.md、相关代码和现有测试。
+2. 只做完成任务所需的最小修改，不修改无关文件。
+3. 在当前 worktree 内编辑；不要提交、推送、创建 PR 或访问生产环境。
+4. 只运行权限允许的聚焦测试和静态检查，不安装依赖。
+5. 审查最终 diff，记录真实执行的测试和剩余风险。
+6. 信息不足、权限不足或无法验证时返回 NEEDS_REVISION。
+7. 最终回复只能是满足下列 JSON Schema 的 JSON 对象，不要使用 Markdown 代码块。
+
+JSON Schema：
+{schema}
+"""
+
+    @staticmethod
+    def _claude_result(events: list[dict[str, Any]]) -> dict[str, Any]:
+        for event in reversed(events):
+            if event.get("type") != "result":
+                continue
+            result = event.get("result")
+            if isinstance(result, dict):
+                return result
+            if isinstance(result, str):
+                return parse_json_object(result)
+        raise RuntimeError("Claude Code 未生成最终 result 事件")
+
+    @staticmethod
+    def _claude_session_id(events: list[dict[str, Any]]) -> str:
+        for event in events:
+            session_id = event.get("session_id")
+            if session_id:
+                return str(session_id)
+        return ""
+
+    @staticmethod
+    def _claude_usage(
+        events: list[dict[str, Any]],
+    ) -> tuple[int, int, float]:
+        for event in reversed(events):
+            if event.get("type") != "result":
+                continue
+            usage = event.get("usage") or {}
+            return (
+                int(usage.get("input_tokens", 0)),
+                int(usage.get("output_tokens", 0)),
+                float(event.get("total_cost_usd", 0) or 0),
+            )
+        return 0, 0, 0.0
+
+    @staticmethod
+    def _claude_execution_log(
+        events: list[dict[str, Any]],
+        stderr: str,
+        process_exit_code: int,
+    ) -> str:
+        lines: list[str] = []
+        for event in events:
+            message = event.get("message") or {}
+            for block in message.get("content", []):
+                if block.get("type") == "tool_use":
+                    tool = block.get("name", "tool")
+                    tool_input = block.get("input") or {}
+                    command = tool_input.get("command")
+                    lines.append(
+                        f"$ {command}" if command else f"[tool] {tool}"
+                    )
+                elif block.get("type") == "tool_result":
+                    content = block.get("content", "")
+                    if content:
+                        lines.append(str(content)[-3000:])
+        if process_exit_code != 0 and stderr.strip():
+            lines.append("[claude stderr]\n" + stderr[-5000:])
+        return "\n\n".join(lines)[-50000:]
+
+    @staticmethod
+    def _structured_test_output(
+        tests: list[dict[str, Any]],
+        diff_check: str,
+    ) -> str:
+        lines = [f"git diff --check: {diff_check}"]
+        for test in tests:
+            lines.append(
+                f"$ {test.get('command', 'unknown')}\n"
+                f"status={test.get('status', 'unknown')}\n"
+                f"{test.get('output', '')}".strip()
+            )
+        return "\n\n".join(lines)[:50000]
+
+
 class TaskExecutor:
     def __init__(self, settings: Any):
         self.model = settings.openai_model
+        self.runtime_priority = getattr(
+            settings,
+            "runtime_priority",
+            ("codex-cli", "claude-code"),
+        )
         self.client = (
             OpenAIResponsesClient(settings.openai_api_key, settings.openai_model)
             if settings.openai_api_key
@@ -455,38 +847,123 @@ class TaskExecutor:
             settings.codex_path,
             settings.allowed_repo_root,
             settings.worktree_root,
-            settings.root / "codex-result.schema.json",
+            settings.root / "runtime-result.schema.json",
             settings.codex_timeout,
             getattr(settings, "codex_env_allowlist", ()),
         ) if settings.codex_enabled else None
+        self.claude = ClaudeCodeExecutor(
+            getattr(settings, "claude_path", ""),
+            settings.allowed_repo_root,
+            settings.worktree_root,
+            settings.root / "runtime-result.schema.json",
+            getattr(settings, "claude_timeout", 900),
+            getattr(settings, "claude_max_turns", 30),
+            getattr(settings, "claude_allowed_tools", ()),
+            getattr(settings, "claude_env_allowlist", ()),
+            getattr(settings, "claude_provider", "Anthropic / Claude account"),
+            getattr(settings, "claude_model", "Claude Code default"),
+            getattr(settings, "claude_api_host", ""),
+            getattr(settings, "claude_config_source", "saved login / default"),
+            getattr(settings, "claude_auth_configured", False),
+            getattr(settings, "claude_config_path", ""),
+        ) if getattr(settings, "claude_enabled", True) else None
+        self.adapters: dict[str, RuntimeAdapter] = {
+            adapter.runtime_id: adapter
+            for adapter in (self.codex, self.claude)
+            if adapter is not None
+        }
 
     @property
     def mode(self) -> str:
-        if self.codex and self.codex.available:
-            return "codex-cli"
+        for runtime_id in self.runtime_priority:
+            adapter = self.adapters.get(runtime_id)
+            if adapter and adapter.available:
+                return runtime_id
         return "openai" if self.client else "demo"
 
     @property
     def model_label(self) -> str:
-        return "Codex saved login" if self.mode == "codex-cli" else self.model
+        adapter = self.adapters.get(self.mode)
+        return adapter.display_name if adapter else self.model
+
+    def runtime_statuses(self) -> list[dict[str, Any]]:
+        statuses = [
+            adapter.diagnostics()
+            for adapter in self.adapters.values()
+        ]
+        statuses.extend([
+            {
+                "id": "openai",
+                "name": "OpenAI Responses",
+                "available": bool(self.client),
+                "status": "configured" if self.client else "not_configured",
+                "provider": "OpenAI",
+                "model": self.model,
+                "api_host": "api.openai.com" if self.client else "",
+                "config_source": "environment",
+                "connectivity": "unchecked",
+            },
+            {
+                "id": "demo",
+                "name": "Demo",
+                "available": True,
+                "status": "ready",
+                "provider": "Local",
+                "model": "Deterministic demo",
+                "api_host": "",
+                "config_source": "built-in",
+                "connectivity": "local",
+            },
+        ])
+        return statuses
+
+    def runtime_info(self, runtime_id: str) -> dict[str, Any]:
+        for runtime in self.runtime_statuses():
+            if runtime["id"] == runtime_id:
+                return runtime
+        raise ValueError(f"未知运行时：{runtime_id}")
 
     def resolve_mode(self, task: dict[str, Any]) -> str:
-        if task.get("repository_path") and self.codex and self.codex.available:
-            return "codex-cli"
-        if self.client:
-            return "openai"
-        return "demo"
+        requested = task.get("runtime_requested") or "auto"
+        if requested != "auto":
+            if requested in self.adapters:
+                adapter = self.adapters[requested]
+                if not task.get("repository_path"):
+                    raise ValueError(
+                        f"{adapter.display_name} 需要填写本地 Git 仓库路径"
+                    )
+                if not adapter.available:
+                    raise ValueError(
+                        f"指定运行时 {adapter.display_name} 当前不可用"
+                    )
+                return requested
+            if requested == "openai":
+                if not self.client:
+                    raise ValueError("OpenAI Responses 当前不可用")
+                return requested
+            if requested == "demo":
+                return requested
+            raise ValueError(f"未知运行时：{requested}")
+
+        if task.get("repository_path"):
+            for runtime_id in self.runtime_priority:
+                adapter = self.adapters.get(runtime_id)
+                if adapter and adapter.available:
+                    return runtime_id
+        return "openai" if self.client else "demo"
 
     async def run(self, task: dict[str, Any]) -> AsyncIterator[StageResult]:
-        if self.resolve_mode(task) == "codex-cli":
-            async for result in self.codex.run(task):
+        mode = self.resolve_mode(task)
+        adapter = self.adapters.get(mode)
+        if adapter:
+            async for result in adapter.run(task):
                 yield result
             return
 
         context: dict[str, str] = {}
         for key, label, instruction in STAGES:
             prompt = self._build_prompt(task, instruction, context)
-            if self.client:
+            if mode == "openai" and self.client:
                 content, input_tokens, output_tokens = await self.client.respond(prompt)
             else:
                 await asyncio.sleep(0.45)
@@ -537,7 +1014,7 @@ Issue：{task.get('issue_url') or '未提供'}
 
 ### 待确认假设
 - 当前为演示模式，尚未读取或修改真实仓库。
-- 填写本地 Git 仓库路径后，将自动切换到 Codex CLI 真实执行。"""
+- 填写本地 Git 仓库路径后，将自动选择可用的真实执行运行时。"""
         if key == "implementation":
             return f"""### 建议修改
 - 定位与“{title}”直接相关的模块，保持单一职责。
